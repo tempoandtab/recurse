@@ -1,0 +1,800 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<title>Recurse — a recursive box-pushing puzzler</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{height:100%;overflow:hidden;background:#0e0f14;color:#e8e6df;
+  font-family:system-ui,-apple-system,'Segoe UI',sans-serif;touch-action:none;
+  overscroll-behavior:none;user-select:none;-webkit-user-select:none}
+#game{position:fixed;inset:0;display:block}
+#hud{position:fixed;top:0;left:0;right:0;display:flex;align-items:center;gap:8px;
+  padding:calc(10px + env(safe-area-inset-top)) 12px 10px;pointer-events:none;z-index:5}
+#hud .spacer{flex:1}
+#levelName{font-weight:700;font-size:15px;letter-spacing:.3px}
+#moves{font-size:12px;color:#8a8fa0}
+.hbtn{pointer-events:auto;background:#1c2029;border:1px solid #2e3340;color:#e8e6df;
+  border-radius:10px;padding:8px 12px;font-size:13px;font-weight:600;cursor:pointer}
+.hbtn:active{background:#2b303c}
+#hint{position:fixed;bottom:calc(14px + env(safe-area-inset-bottom));left:0;right:0;
+  text-align:center;font-size:13px;color:#8a8fa0;padding:0 24px;pointer-events:none;z-index:5}
+.overlay{position:fixed;inset:0;background:rgba(8,9,12,.82);display:none;
+  align-items:center;justify-content:center;z-index:20;padding:24px}
+.overlay.show{display:flex}
+.card{background:#171a21;border:1px solid #2b303c;border-radius:18px;padding:26px 24px;
+  max-width:420px;width:100%;max-height:80vh;overflow:auto;text-align:center}
+.card h2{font-size:22px;margin-bottom:6px}
+.card p{font-size:14px;color:#a7abb9;line-height:1.55;margin:10px 0}
+.card .big{font-size:15px;color:#e8e6df}
+.bigbtn{display:inline-block;margin-top:14px;background:#39c6d6;color:#08272b;border:0;
+  border-radius:12px;padding:12px 26px;font-size:16px;font-weight:700;cursor:pointer}
+.bigbtn.ghost{background:#2b303c;color:#e8e6df;margin-left:8px}
+#levelList{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:14px}
+.lvl{background:#1c2029;border:1px solid #2e3340;border-radius:12px;padding:12px 8px;
+  color:#e8e6df;cursor:pointer;display:flex;flex-direction:column;gap:2px;align-items:center}
+.lvl .n{font-size:20px;font-weight:800;color:#39c6d6}
+.lvl .t{font-size:12px}
+.lvl .d{font-size:11px;color:#7ee2a8}
+.lvl.locked{opacity:.32;cursor:default}
+.lvl.locked .n{color:#8a8fa0}
+ul.howto{text-align:left;font-size:14px;color:#a7abb9;line-height:1.7;margin:12px 0 0 18px}
+ul.howto b{color:#e8e6df}
+kbd{background:#2b303c;border-radius:5px;padding:1px 7px;font-size:12px;font-family:inherit}
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<div id="hud">
+  <button class="hbtn" id="btnLevels">☰</button>
+  <div><div id="levelName"></div><div id="moves"></div></div>
+  <div class="spacer"></div>
+  <button class="hbtn" id="btnUndo">↩ Undo</button>
+  <button class="hbtn" id="btnReset">⟲</button>
+  <button class="hbtn" id="btnHelp">?</button>
+</div>
+<div id="hint"></div>
+
+<div class="overlay" id="winOverlay"><div class="card">
+  <h2>Solved 🎉</h2>
+  <p class="big" id="winMoves"></p>
+  <p>Boxes within boxes, and you saw through all of them.</p>
+  <button class="bigbtn" id="btnNext">Next level →</button>
+  <button class="bigbtn ghost" onclick="document.getElementById('winOverlay').classList.remove('show')">Replay</button>
+</div></div>
+
+<div class="overlay" id="levelsOverlay"><div class="card">
+  <h2>Levels</h2>
+  <div id="levelList"></div>
+  <button class="bigbtn ghost" onclick="document.getElementById('levelsOverlay').classList.remove('show')">Close</button>
+</div></div>
+
+<div class="overlay" id="helpOverlay"><div class="card">
+  <h2>Recurse</h2>
+  <p class="big">A puzzle game about boxes within boxes.</p>
+  <ul class="howto">
+    <li><b>Push</b> every box onto a glowing goal — <kbd>←↑↓→</kbd>, <kbd>WASD</kbd>, or swipe.</li>
+    <li><b>Teal boxes are hollow.</b> Walk into one through its <b style="color:#ffe66d">gold door</b> to explore the world inside.</li>
+    <li>Push boxes <b>into</b> and <b>out of</b> hollow boxes through their doors.</li>
+    <li><b>↩</b> undoes freely, <b>⟲</b> restarts. Experiment!</li>
+  </ul>
+  <button class="bigbtn" onclick="document.getElementById('helpOverlay').classList.remove('show')">Start pushing</button>
+</div></div>
+
+<script>
+/* ===== game.js ===== */
+'use strict';
+/* Recurse — pure game logic, no DOM. Works in node and browser. */
+
+const DIRS = { N:[0,-1], S:[0,1], W:[-1,0], E:[1,0] };
+const DOOR_OUT = { N:[0,-1], S:[0,1], W:[-1,0], E:[1,0] };
+
+function key(x,y){ return x+','+y; }
+
+// Parse one ASCII map. Legend: # wall, . or space floor, * goal, P player,
+// B solid box, H hollow box (consumes one entry from hollows[] in row-major order).
+function parseSpace(rows, hollows){
+  const h = rows.length, w = rows[0].length;
+  const walls = new Set(), goals = new Set();
+  const boxes = []; let player = null;
+  const hq = (hollows||[]).slice();
+  for(let y=0;y<h;y++){
+    if(rows[y].length!==w) throw new Error('ragged map row '+y);
+    for(let x=0;x<w;x++){
+      const c = rows[y][x], k = key(x,y);
+      if(c==='#'){ walls.add(k); continue; }
+      if(c==='*') goals.add(k);
+      else if(c==='P'){ if(player) throw new Error('two players'); player={x,y}; }
+      else if(c==='B') boxes.push({x,y,hollow:null});
+      else if(c==='H'){
+        const hd = hq.shift();
+        if(!hd) throw new Error('H at '+k+' has no hollow def');
+        boxes.push({x,y,hollow:hd});
+      }
+      else if(c!=='.' && c!==' ') throw new Error('bad tile '+c+' at '+k);
+    }
+  }
+  return {w,h,walls,goals,boxes,player};
+}
+
+// Find border gaps (non-wall border cells). Returns [{x,y,ox,oy,ix,iy}].
+function findGaps(sp){
+  const gaps=[]; const seen=new Set();
+  const add=(x,y,ox,oy)=>{
+    const k=key(x,y); if(seen.has(k)) return; seen.add(k);
+    gaps.push({x,y,ox,oy,ix:x-ox,iy:y-oy});
+  };
+  for(let x=0;x<sp.w;x++){
+    if(!sp.walls.has(key(x,0))) add(x,0,0,-1);
+    if(!sp.walls.has(key(x,sp.h-1))) add(x,sp.h-1,0,1);
+  }
+  for(let y=0;y<sp.h;y++){
+    if(!sp.walls.has(key(0,y))) add(0,y,-1,0);
+    if(!sp.walls.has(key(sp.w-1,y))) add(sp.w-1,y,1,0);
+  }
+  return gaps;
+}
+
+// Load a level def into static structures + initial state.
+// Level def: {name, map:[...], boxes:[...] (solid, rarely needed), hollows:[{door,map,hollows,boxes}]}
+function loadLevel(def){
+  const spaces={}; const boxes={};
+  let sidc=0, bidc=0;
+  function buildSpace(parsed, parent){
+    const sid='s'+(sidc++);
+    const gaps = parent ? findGaps(parsed) : [];
+    if(parent && gaps.length!==1) throw new Error('inner space must have exactly 1 door gap, got '+gaps.length);
+    const sp={id:sid,w:parsed.w,h:parsed.h,walls:parsed.walls,goals:parsed.goals,
+              gap: parent?gaps[0]:null, parent:parent||null};
+    spaces[sid]=sp;
+    const boxIds=[];
+    for(const b of parsed.boxes){
+      const bid='b'+(bidc++);
+      if(b.hollow){
+        const o=DOOR_OUT[b.hollow.door||'S'];
+        const innerParsed=parseSpace(b.hollow.map, b.hollow.hollows);
+        // inner solid boxes from def
+        const innerRes=buildSpace(innerParsed,{boxId:bid,spaceId:sid});
+        const innerSid=innerRes.sid;
+        for(const e of innerRes.boxIds) boxIds.push(e);
+        for(const ib of (b.hollow.boxes||[])){
+          const ibid='b'+(bidc++);
+          boxes[ibid]={id:ibid,hollow:false,innerSpace:null,outward:null};
+          boxIds.push({bid:ibid,def:ib,space:innerSid});
+        }
+        boxes[bid]={id:bid,hollow:true,innerSpace:innerSid,outward:{ox:o[0],oy:o[1]}};
+      }else{
+        boxes[bid]={id:bid,hollow:false,innerSpace:null,outward:null};
+      }
+      boxIds.push({bid,def:b,space:sid});
+    }
+    return {sid,boxIds,player:parsed.player};
+  }
+  const rootParsed=parseSpace(def.map, def.hollows);
+  // root-level extra solid boxes
+  for(const b of (def.boxes||[])) rootParsed.boxes.push({x:b.x,y:b.y,hollow:null});
+  const {sid,boxIds,player}=buildSpace(rootParsed,null);
+  if(!player) throw new Error('level has no player start');
+  const state={player:{s:sid,x:player.x,y:player.y},pos:{}};
+  for(const {bid,def:b,space} of boxIds) state.pos[bid]={s:space,x:b.x,y:b.y};
+  return {name:def.name,spaces,boxes,initial:state,rootSid:sid};
+}
+
+function boxAt(st, sid, x, y){
+  for(const bid in st.pos){
+    const p=st.pos[bid];
+    if(p.s===sid && p.x===x && p.y===y) return bid;
+  }
+  return null;
+}
+function inBounds(S,x,y){ return x>=0&&y>=0&&x<S.w&&y<S.h; }
+function cellFreeForBox(level,st,sid,x,y){
+  const S=level.spaces[sid];
+  return inBounds(S,x,y)&&!S.walls.has(key(x,y))&&!boxAt(st,sid,x,y);
+}
+// BFS nearest free floor cell (no box, not the door gap) from (x,y) in space sid.
+function nearestFree(level,st,sid,x,y){
+  const S=level.spaces[sid];
+  const seen=new Set([key(x,y)]); const q=[{x,y}];
+  while(q.length){
+    const c=q.shift();
+    const isGap=S.gap&&c.x===S.gap.x&&c.y===S.gap.y;
+    if(!isGap&&inBounds(S,c.x,c.y)&&!S.walls.has(key(c.x,c.y))&&!boxAt(st,sid,c.x,c.y)) return c;
+    for(const d of [[0,1],[0,-1],[1,0],[-1,0]]){
+      const nx=c.x+d[0],ny=c.y+d[1],k=key(nx,ny);
+      if(!seen.has(k)){seen.add(k);q.push({x:nx,y:ny});}
+    }
+  }
+  return null;
+}
+
+function cloneState(st){
+  const pos={};
+  for(const bid in st.pos) pos[bid]={s:st.pos[bid].s,x:st.pos[bid].x,y:st.pos[bid].y};
+  return {player:{s:st.player.s,x:st.player.x,y:st.player.y},pos};
+}
+function stateKey(st){
+  const parts=[st.player.s+':'+st.player.x+','+st.player.y];
+  const bids=Object.keys(st.pos).sort();
+  for(const b of bids){const p=st.pos[b];parts.push(b+'='+p.s+':'+p.x+','+p.y);}
+  return parts.join('|');
+}
+
+// Exit entity (player if bid null, else box bid) from inner space S outward.
+function doExit(level,st,S,bid){
+  const parent=S.parent; if(!parent) return false;
+  const O=level.spaces[parent.spaceId];
+  const pp=st.pos[parent.boxId];
+  const lx=pp.x+S.gap.ox, ly=pp.y+S.gap.oy;
+  if(!cellFreeForBox(level,st,O.id,lx,ly)) return false;
+  if(bid){
+    const old=st.pos[bid];
+    st.pos[bid]={s:O.id,x:lx,y:ly};
+    st.player={s:old.s,x:old.x,y:old.y};
+  }else{
+    st.player={s:O.id,x:lx,y:ly};
+  }
+  return true;
+}
+
+// The single move function. Mutates st. Returns true if the move happened.
+function move(level, st, dx, dy){
+  const S=level.spaces[st.player.s];
+  const nx=st.player.x+dx, ny=st.player.y+dy;
+  if(!inBounds(S,nx,ny)||S.walls.has(key(nx,ny))) return false;
+  const isGap=S.gap&&nx===S.gap.x&&ny===S.gap.y;
+  const b=boxAt(st,S.id,nx,ny);
+  if(b){
+    const B=level.boxes[b];
+    // enter hollow box through its door?
+    if(B.hollow&&dx===-B.outward.ox&&dy===-B.outward.oy){
+      const I=level.spaces[B.innerSpace];
+      const cell=nearestFree(level,st,I.id,I.gap.ix,I.gap.iy);
+      if(!cell) return false;
+      st.player={s:I.id,x:cell.x,y:cell.y};
+      return true;
+    }
+    return pushBox(level,st,b,dx,dy);
+  }
+  if(isGap) return doExit(level,st,S,null);
+  st.player.x=nx; st.player.y=ny;
+  return true;
+}
+
+function pushBox(level, st, bid, dx, dy){
+  const B=level.boxes[bid];
+  const bp=st.pos[bid];
+  const S=level.spaces[bp.s];
+  const nx=bp.x+dx, ny=bp.y+dy;
+  if(!inBounds(S,nx,ny)||S.walls.has(key(nx,ny))) return false;
+  const isGap=S.gap&&nx===S.gap.x&&ny===S.gap.y;
+  const ob=boxAt(st,S.id,nx,ny);
+  if(ob){
+    const OB=level.boxes[ob];
+    // push into a hollow box through its door?
+    if(OB.hollow&&dx===-OB.outward.ox&&dy===-OB.outward.oy){
+      const I=level.spaces[OB.innerSpace];
+      const cell=nearestFree(level,st,I.id,I.gap.ix,I.gap.iy);
+      if(!cell) return false;
+      st.pos[bid]={s:I.id,x:cell.x,y:cell.y};
+      st.player={s:bp.s,x:bp.x,y:bp.y};
+      return true;
+    }
+    return false;
+  }
+  if(isGap) return doExit(level,st,S,bid);
+  st.pos[bid]={s:bp.s,x:nx,y:ny};
+  st.player={s:bp.s,x:bp.x,y:bp.y};
+  return true;
+}
+
+function isWin(level,st){
+  for(const sid in level.spaces){
+    const S=level.spaces[sid];
+    for(const g of S.goals){
+      const [gx,gy]=g.split(',').map(Number);
+      if(!boxAt(st,sid,gx,gy)) return false;
+    }
+  }
+  return true;
+}
+
+// BFS solver. Returns array of [dx,dy] or null if unsolvable within cap.
+function solve(level, cap){
+  cap=cap||200000;
+  const start=cloneState(level.initial);
+  const sk=stateKey(start);
+  const prev=new Map(); prev.set(sk,null);
+  const q=[start]; let qi=0;
+  const dirs=[[0,1],[0,-1],[1,0],[-1,0]];
+  while(qi<q.length){
+    if(qi>=cap) return null;
+    const cur=q[qi++];
+    if(isWin(level,cur)){
+      const path=[]; let k=stateKey(cur);
+      while(prev.get(k)){const [pk,d]=prev.get(k);path.unshift(d);k=pk;}
+      return path;
+    }
+    for(const d of dirs){
+      const ns=cloneState(cur);
+      if(move(level,ns,d[0],d[1])){
+        const k=stateKey(ns);
+        if(!prev.has(k)){prev.set(k,[stateKey(cur),d]);q.push(ns);}
+      }
+    }
+  }
+  return null;
+}
+
+if(typeof module!=='undefined'){module.exports={loadLevel,move,pushBox,isWin,solve,cloneState,stateKey,DIRS};}
+/* ===== levels.js ===== */
+'use strict';
+/* Recurse — level definitions. Legend: # wall, . floor, * goal, P player,
+   B solid box, H hollow box (hollows[] consumed in row-major H order).
+   All hollow doors face South in this set; inner maps have one south gap. */
+
+const LEVELS=[
+{
+name:'First Push',
+hint:'Push the box onto the glowing goal. Swipe or use arrow keys.',
+map:[
+'#####',
+'#P.B*',
+'#####',
+],
+},
+{
+name:'Open the Box',
+hint:'Some boxes are hollow. Walk into this one from below.',
+map:[
+'#######',
+'#.....#',
+'#.P.H.#',
+'#.....#',
+'#######',
+],
+hollows:[{door:'S',map:[
+'#####',
+'#.*.#',
+'#.B.#',
+'#...#',
+'##.##',
+]}],
+},
+{
+name:'Take It Out',
+hint:'The box you need is inside. Push it out through the door.',
+map:[
+'#######',
+'#.....#',
+'#.P.H.#',
+'#...*.#',
+'#######',
+],
+hollows:[{door:'S',map:[
+'#####',
+'#...#',
+'#.B.#',
+'#...#',
+'##.##',
+]}],
+},
+{
+name:'Put It In',
+hint:'Push the box north, straight into the hollow box.',
+map:[
+'#####',
+'#...#',
+'#.H.#',
+'#.B.#',
+'#.P.#',
+'#####',
+],
+hollows:[{door:'S',map:[
+'#####',
+'#...#',
+'#...#',
+'#.*.#',
+'##.##',
+]}],
+},
+{
+name:'Inside Job',
+hint:'Send the box in, then follow it and finish the job inside.',
+map:[
+'#####',
+'#...#',
+'#.H.#',
+'#.B.#',
+'#.P.#',
+'#####',
+],
+hollows:[{door:'S',map:[
+'#######',
+'#.....#',
+'#.B.*.#',
+'#.....#',
+'###.###',
+]}],
+},
+{
+name:'Two Deep',
+hint:'A box within a box. How far down does it go?',
+map:[
+'#######',
+'#.....#',
+'#.P.H.#',
+'#.....#',
+'#######',
+],
+hollows:[{door:'S',map:[
+'#######',
+'#.....#',
+'#..H..#',
+'#.....#',
+'###.###',
+],
+hollows:[{door:'S',map:[
+'#####',
+'#.*.#',
+'#.B.#',
+'#...#',
+'##.##',
+]}]}],
+},
+{
+name:'Trade Up',
+hint:'Push the box in from outside, then go in after it.',
+map:[
+'########',
+'#......#',
+'#.P....#',
+'#......#',
+'#..H...#',
+'#..B...#',
+'#......#',
+'########',
+],
+hollows:[{door:'S',map:[
+'#####',
+'#...#',
+'#...#',
+'#*..#',
+'##.##',
+]}],
+},
+{
+name:'Heavy Lifting',
+hint:'Hollow boxes can be pushed too. Get this one onto the goal.',
+map:[
+'#######',
+'#.....#',
+'#.P.H.#',
+'#..*..#',
+'#######',
+],
+hollows:[{door:'S',map:[
+'#####',
+'#...#',
+'#...#',
+'#...#',
+'##.##',
+]}],
+},
+];
+
+if(typeof module!=='undefined'){module.exports={LEVELS};}
+/* ===== ui.js ===== */
+'use strict';
+/* Recurse — UI layer (DOM + canvas). game.js and levels.js are inlined above. */
+
+const canvas=document.getElementById('game');
+const ctx=canvas.getContext('2d');
+let W=0,H=0,DPR=1;
+
+function resize(){
+  DPR=Math.min(2,window.devicePixelRatio||1);
+  W=window.innerWidth; H=window.innerHeight;
+  canvas.width=W*DPR; canvas.height=H*DPR;
+  canvas.style.width=W+'px'; canvas.style.height=H+'px';
+  ctx.setTransform(DPR,0,0,DPR,0,0);
+}
+window.addEventListener('resize',resize); resize();
+
+// ---------- state ----------
+let levelIdx=0, level=null, state=null, undoStack=[];
+let viewSpace=null;                 // space id currently viewed
+let viewAnim=null;                  // {oldS,newS,t0,dur,dir}
+let renderPos={};                   // bid -> {x,y} lerped (view space only)
+let playerRender={x:0,y:0};
+let progress={unlocked:0,done:{}};
+try{const p=JSON.parse(localStorage.getItem('recurse-progress'));if(p)progress=p;}catch(e){}
+function saveProgress(){try{localStorage.setItem('recurse-progress',JSON.stringify(progress));}catch(e){}}
+
+const COLORS={
+  bg:'#0e0f14', floor:'#171a21', wall:'#2b303c', wallTop:'#3a4152',
+  goal:'#f5b942', goalGlow:'rgba(245,185,66,.35)',
+  solid:'#e2603f', hollow:'#39c6d6', hollowDim:'rgba(57,198,214,.16)',
+  door:'#ffe66d', player:'#f4f1ea', text:'#e8e6df', dim:'#8a8fa0'
+};
+
+function loadLevelIdx(i){
+  levelIdx=i;
+  level=loadLevel(LEVELS[i]);
+  state=cloneState(level.initial);
+  undoStack=[];
+  viewSpace=state.player.s;
+  viewAnim=null;
+  renderPos={};
+  for(const bid in state.pos){const p=state.pos[bid];renderPos[bid]={x:p.x,y:p.y};}
+  playerRender={x:state.player.x,y:state.player.y};
+  document.getElementById('levelName').textContent=(i+1)+' · '+level.name;
+  document.getElementById('hint').textContent=LEVELS[i].hint||'';
+  updateMoves();
+  hideOverlay();
+  renderLevelList();
+}
+function updateMoves(){
+  document.getElementById('moves').textContent='moves '+undoStack.length;
+}
+
+function doMove(dx,dy){
+  const before=viewSpace;
+  undoStack.push(cloneState(state));
+  if(undoStack.length>1000)undoStack.shift();
+  if(!move(level,state,dx,dy)){undoStack.pop();return;}
+  updateMoves();
+  if(state.player.s!==before){
+    viewAnim={oldS:before,newS:state.player.s,t0:performance.now(),dur:320,
+              dir:depthOf(state.player.s)>depthOf(before)?'in':'out'};
+    viewSpace=state.player.s;
+  }
+  if(isWin(level,state)){
+    const moves=undoStack.length;
+    const prev=progress.done[levelIdx];
+    if(!prev||moves<prev)progress.done[levelIdx]=moves;
+    if(levelIdx+1<LEVELS.length&&progress.unlocked<levelIdx+1)progress.unlocked=levelIdx+1;
+    saveProgress(); renderLevelList();
+    setTimeout(()=>showWin(moves),450);
+  }
+}
+function depthOf(sid){let d=0,s=level.spaces[sid];while(s&&s.parent){d++;s=level.spaces[s.parent.spaceId];}return d;}
+function undo(){
+  if(!undoStack.length)return;
+  state=undoStack.pop();
+  const before=viewSpace;
+  viewSpace=state.player.s;
+  if(viewSpace!==before)viewAnim={oldS:before,newS:viewSpace,t0:performance.now(),dur:320,dir:'out'};
+  updateMoves();
+}
+function reset(){loadLevelIdx(levelIdx);}
+
+// ---------- input ----------
+window.addEventListener('keydown',e=>{
+  const k=e.key.toLowerCase();
+  let d=null;
+  if(k==='arrowup'||k==='w')d=[0,-1];
+  else if(k==='arrowdown'||k==='s')d=[0,1];
+  else if(k==='arrowleft'||k==='a')d=[-1,0];
+  else if(k==='arrowright'||k==='d')d=[1,0];
+  else if(k==='z')undo();
+  else if(k==='r')reset();
+  if(d){e.preventDefault();doMove(d[0],d[1]);}
+});
+let tsx=0,tsy=0;
+canvas.addEventListener('touchstart',e=>{const t=e.touches[0];tsx=t.clientX;tsy=t.clientY;},{passive:true});
+canvas.addEventListener('touchend',e=>{
+  const t=e.changedTouches[0];
+  const dx=t.clientX-tsx,dy=t.clientY-tsy;
+  if(Math.hypot(dx,dy)<24)return;
+  if(Math.abs(dx)>Math.abs(dy))doMove(dx>0?1:-1,0);
+  else doMove(0,dy>0?1:-1);
+});
+canvas.addEventListener('touchmove',e=>e.preventDefault(),{passive:false});
+
+document.getElementById('btnUndo').onclick=undo;
+document.getElementById('btnReset').onclick=reset;
+document.getElementById('btnLevels').onclick=()=>showOverlay('levelsOverlay');
+document.getElementById('btnHelp').onclick=()=>showOverlay('helpOverlay');
+document.getElementById('btnNext').onclick=()=>{if(levelIdx+1<LEVELS.length)loadLevelIdx(levelIdx+1);};
+
+// ---------- rendering ----------
+function roundRect(x,y,w,h,r){
+  ctx.beginPath();
+  ctx.moveTo(x+r,y);ctx.arcTo(x+w,y,x+w,y+h,r);ctx.arcTo(x+w,y+h,x,y+h,r);
+  ctx.arcTo(x,y+h,x,y,r);ctx.arcTo(x,y,x+w,y,r);ctx.closePath();
+}
+function layout(sid){
+  const S=level.spaces[sid];
+  const pad=20, hudH=120;
+  const cell=Math.min((W-2*pad)/S.w,(H-2*pad-hudH)/S.h);
+  const ox=(W-cell*S.w)/2, oy=(H-hudH-cell*S.h)/2+8;
+  return {S,cell,ox,oy};
+}
+function boxAtRender(sid,x,y){
+  for(const bid in state.pos){const p=state.pos[bid];if(p.s===sid&&p.x===x&&p.y===y)return bid;}
+  return null;
+}
+function drawSpace(sid,ox,oy,cell,depth){
+  const S=level.spaces[sid];
+  for(let y=0;y<S.h;y++)for(let x=0;x<S.w;x++){
+    const px=ox+x*cell,py=oy+y*cell,k=x+','+y;
+    if(S.walls.has(k)){
+      ctx.fillStyle=COLORS.wall;ctx.fillRect(px,py,cell,cell);
+      ctx.fillStyle=COLORS.wallTop;ctx.fillRect(px,py,cell,Math.max(2,cell*0.12));
+    }else{
+      ctx.fillStyle=COLORS.floor;ctx.fillRect(px,py,cell,cell);
+      if(S.goals.has(k)){
+        ctx.save();
+        ctx.shadowColor=COLORS.goal;ctx.shadowBlur=cell*0.5;
+        ctx.fillStyle=COLORS.goal;
+        const cx=px+cell/2,cy=py+cell/2,r=cell*0.28;
+        ctx.beginPath();ctx.moveTo(cx,cy-r);ctx.lineTo(cx+r,cy);ctx.lineTo(cx,cy+r);ctx.lineTo(cx-r,cy);ctx.closePath();ctx.fill();
+        ctx.restore();
+      }
+    }
+  }
+  // grid lines
+  ctx.strokeStyle='rgba(255,255,255,.03)';ctx.lineWidth=1;
+  ctx.beginPath();
+  for(let x=0;x<=S.w;x++){ctx.moveTo(ox+x*cell,oy);ctx.lineTo(ox+x*cell,oy+S.h*cell);}
+  for(let y=0;y<=S.h;y++){ctx.moveTo(ox,oy+y*cell);ctx.lineTo(ox+S.w*cell,oy+y*cell);}
+  ctx.stroke();
+  // boxes
+  for(const bid in state.pos){
+    const p=state.pos[bid];if(p.s!==sid)continue;
+    const B=level.boxes[bid];
+    const px=ox+p.x*cell,py=oy+p.y*cell;
+    let rx=px,ry=py;
+    if(depth===0&&renderPos[bid]){rx=ox+renderPos[bid].x*cell;ry=oy+renderPos[bid].y*cell;}
+    if(B.hollow)drawHollow(B,bid,rx,ry,cell,depth);
+    else{
+      const m=cell*0.12;
+      ctx.fillStyle=COLORS.solid;
+      roundRect(rx+m,ry+m,cell-2*m,cell-2*m,cell*0.18);ctx.fill();
+      ctx.fillStyle='rgba(255,255,255,.25)';
+      roundRect(rx+m*1.6,ry+m*1.6,cell-3.2*m,(cell-3.2*m)*0.32,cell*0.1);ctx.fill();
+    }
+  }
+  // player
+  if(state.player.s===sid){
+    let px=state.player.x,py=state.player.y;
+    if(depth===0){px=playerRender.x;py=playerRender.y;}
+    const cx=ox+(px+0.5)*cell,cy=oy+(py+0.5)*cell,r=cell*0.32;
+    ctx.save();
+    ctx.shadowColor='rgba(244,241,234,.5)';ctx.shadowBlur=cell*0.3;
+    ctx.fillStyle=COLORS.player;
+    ctx.beginPath();ctx.arc(cx,cy,r,0,7);ctx.fill();
+    ctx.restore();
+    ctx.fillStyle='#222';
+    ctx.beginPath();ctx.arc(cx-r*0.32,cy-r*0.1,r*0.16,0,7);ctx.arc(cx+r*0.32,cy-r*0.1,r*0.16,0,7);ctx.fill();
+  }
+}
+function drawHollow(B,bid,px,py,cell,depth){
+  const m=cell*0.1;
+  // shell
+  ctx.strokeStyle=COLORS.hollow;ctx.lineWidth=Math.max(2,cell*0.07);
+  const x0=px+m,y0=py+m,x1=px+cell-m,y1=py+cell-m;
+  // door gap on outward side
+  const o=B.outward,g=cell*0.22;
+  ctx.beginPath();
+  const seg=(ax,ay,bx,by)=>{ctx.moveTo(ax,ay);ctx.lineTo(bx,by);};
+  if(o.oy===1){ // gap on south edge
+    seg(x0,y0,x1,y0);seg(x1,y0,x1,y1);seg(x0,y0,x0,y1);
+    const cx=(x0+x1)/2;
+    seg(x0,y1,cx-g/2,y1);seg(cx+g/2,y1,x1,y1);
+    // door marker
+    ctx.fillStyle=COLORS.door;
+    ctx.fillRect(cx-g/2,y1-cell*0.05,g,cell*0.1);
+  }else if(o.oy===-1){
+    seg(x0,y1,x1,y1);seg(x1,y0,x1,y1);seg(x0,y0,x0,y1);
+    const cx=(x0+x1)/2;
+    seg(x0,y0,cx-g/2,y0);seg(cx+g/2,y0,x1,y0);
+    ctx.fillStyle=COLORS.door;ctx.fillRect(cx-g/2,y0-cell*0.05,g,cell*0.1);
+  }else if(o.ox===1){
+    seg(x0,y0,x0,y1);seg(x0,y0,x1,y0);seg(x0,y1,x1,y1);
+    const cy=(y0+y1)/2;
+    seg(x1,y0,x1,cy-g/2);seg(x1,cy+g/2,x1,y1);
+    ctx.fillStyle=COLORS.door;ctx.fillRect(x1-cell*0.05,cy-g/2,cell*0.1,g);
+  }else{
+    seg(x1,y0,x1,y1);seg(x0,y0,x1,y0);seg(x0,y1,x1,y1);
+    const cy=(y0+y1)/2;
+    seg(x0,y0,x0,cy-g/2);seg(x0,cy+g/2,x0,y1);
+    ctx.fillStyle=COLORS.door;ctx.fillRect(x0-cell*0.05,cy-g/2,cell*0.1,g);
+  }
+  ctx.stroke();
+  // nested content
+  if(depth>=4)return;
+  const I=level.spaces[B.innerSpace];
+  const iw=x1-x0, ih=y1-y0;
+  const ic=Math.min(iw/I.w,ih/I.h)*0.92;
+  const iox=x0+(iw-ic*I.w)/2, ioy=y0+(ih-ic*I.h)/2;
+  ctx.save();
+  ctx.beginPath();ctx.rect(x0,y0,iw,ih);ctx.clip();
+  ctx.fillStyle='rgba(0,0,0,.25)';ctx.fillRect(x0,y0,iw,ih);
+  drawSpace(I.id,iox,ioy,ic,depth+1);
+  ctx.restore();
+}
+
+function render(now){
+  ctx.fillStyle=COLORS.bg;ctx.fillRect(0,0,W,H);
+  // lerp render positions toward logic (view space only)
+  const k=0.28;
+  for(const bid in state.pos){
+    const p=state.pos[bid];
+    if(!renderPos[bid]||p.s!==viewSpace){renderPos[bid]={x:p.x,y:p.y};continue;}
+    const r=renderPos[bid];
+    r.x+=(p.x-r.x)*k; r.y+=(p.y-r.y)*k;
+    if(Math.abs(r.x-p.x)<0.01)r.x=p.x; if(Math.abs(r.y-p.y)<0.01)r.y=p.y;
+  }
+  if(state.player.s===viewSpace){
+    playerRender.x+=(state.player.x-playerRender.x)*k;
+    playerRender.y+=(state.player.y-playerRender.y)*k;
+  }else{playerRender={x:state.player.x,y:state.player.y};}
+
+  if(viewAnim){
+    const t=Math.min(1,(now-viewAnim.t0)/viewAnim.dur);
+    const e=1-Math.pow(1-t,3);
+    drawView(viewAnim.oldS,viewAnim.dir==='in'?1+0.7*e:1-0.45*e,1-e);
+    drawView(viewAnim.newS,viewAnim.dir==='in'?1.7-0.7*e:0.55+0.45*e,e);
+    if(t>=1)viewAnim=null;
+  }else{
+    drawView(viewSpace,1,1);
+  }
+  // depth breadcrumb
+  const d=depthOf(viewSpace);
+  if(d>0){
+    ctx.fillStyle=COLORS.dim;ctx.font='13px system-ui';ctx.textAlign='center';
+    ctx.fillText('depth '+d+' · '+(d===1?'inside a box':'inside '.concat(d,' boxes')),W/2,H-58);
+  }
+  requestAnimationFrame(render);
+}
+function drawView(sid,scale,alpha){
+  const {S,cell,ox,oy}=layout(sid);
+  ctx.save();
+  ctx.globalAlpha=alpha;
+  const cx=ox+S.w*cell/2, cy=oy+S.h*cell/2;
+  ctx.translate(cx,cy);ctx.scale(scale,scale);ctx.translate(-cx,-cy);
+  drawSpace(sid,ox,oy,cell,0);
+  ctx.restore();
+}
+
+// ---------- overlays ----------
+function showOverlay(id){
+  document.querySelectorAll('.overlay').forEach(o=>o.classList.remove('show'));
+  document.getElementById(id).classList.add('show');
+}
+function hideOverlay(){
+  document.querySelectorAll('.overlay').forEach(o=>o.classList.remove('show'));
+}
+document.querySelectorAll('.overlay').forEach(o=>{
+  o.addEventListener('click',e=>{if(e.target===o)hideOverlay();});
+});
+function showWin(moves){
+  document.getElementById('winMoves').textContent=moves+(moves===1?' move':' moves');
+  document.getElementById('btnNext').style.display=(levelIdx+1<LEVELS.length)?'':'none';
+  showOverlay('winOverlay');
+}
+function renderLevelList(){
+  const el=document.getElementById('levelList');el.innerHTML='';
+  LEVELS.forEach((L,i)=>{
+    const b=document.createElement('button');
+    b.className='lvl'+(i<=progress.unlocked?'':' locked');
+    const done=progress.done[i];
+    b.innerHTML='<span class="n">'+(i+1)+'</span><span class="t">'+L.name+'</span>'+
+      (done?'<span class="d">'+done+' ✓</span>':'');
+    if(i<=progress.unlocked)b.onclick=()=>loadLevelIdx(i);
+    el.appendChild(b);
+  });
+}
+
+// ---------- boot ----------
+loadLevelIdx(Math.min(progress.unlocked,LEVELS.length-1));
+let seenHelp=false;
+try{seenHelp=!!localStorage.getItem('recurse-seen-help');}catch(e){}
+if(!seenHelp){showOverlay('helpOverlay');try{localStorage.setItem('recurse-seen-help','1');}catch(e){}}
+requestAnimationFrame(render);
+</script></body></html>
