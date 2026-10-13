@@ -79,15 +79,28 @@ kbd{background:#2b303c;border-radius:5px;padding:1px 7px;font-size:12px;font-fam
     <li><b>Push</b> every box onto a glowing goal — <kbd>←↑↓→</kbd>, <kbd>WASD</kbd>, or swipe.</li>
     <li><b>Teal boxes are hollow.</b> Walk into one through its <b style="color:#ffe66d">gold door</b> to explore the world inside.</li>
     <li>Push boxes <b>into</b> and <b>out of</b> hollow boxes through their doors.</li>
+    <li><b>∞ boxes are recursive.</b> The world inside is the world you're in. Walk in through the <b style="color:#ffe66d">gold door</b> to go one level deeper — as deep as you like. Bump the <b>back</b> of the box to climb back out. Only boxes in the outer world count toward goals.</li>
     <li><b>↩</b> undoes freely, <b>⟲</b> restarts. Experiment!</li>
   </ul>
   <button class="bigbtn" onclick="document.getElementById('helpOverlay').classList.remove('show')">Start pushing</button>
 </div></div>
 
 <script>
-/* ===== game.js ===== */
+/* ===== engine.js ===== */
 'use strict';
-/* Recurse — pure game logic, no DOM. Works in node and browser. */
+/* Recurse — pure game logic, no DOM. Works in node and browser.
+ *
+ * Box kinds:
+ *  - solid boxes (B): pushed onto goals.
+ *  - hollow boxes (H): contain a separate inner world; entered / pushed-through via door.
+ *  - recursive boxes (R): IMMOVABLE. Their inner world IS the world that contains them
+ *    (self-containing). Stepping (or pushing a box) through the gold door descends one
+ *    recursion level; bumping the back of the box ascends one level (depth >= 1 only).
+ *
+ * Depth model: one world template, entities tagged with depth d. The player and every
+ * normal box carry d (start at 0). A recursive box exists at every depth (architecture).
+ * Win rule: only boxes at depth 0 count toward goals.
+ */
 
 const DIRS = { N:[0,-1], S:[0,1], W:[-1,0], E:[1,0] };
 const DOOR_OUT = { N:[0,-1], S:[0,1], W:[-1,0], E:[1,0] };
@@ -95,12 +108,14 @@ const DOOR_OUT = { N:[0,-1], S:[0,1], W:[-1,0], E:[1,0] };
 function key(x,y){ return x+','+y; }
 
 // Parse one ASCII map. Legend: # wall, . or space floor, * goal, P player,
-// B solid box, H hollow box (consumes one entry from hollows[] in row-major order).
-function parseSpace(rows, hollows){
+// B solid box, H hollow box (consumes hollows[] in row-major order),
+// R recursive box (consumes recursives[] in row-major order).
+function parseSpace(rows, hollows, recursives){
   const h = rows.length, w = rows[0].length;
   const walls = new Set(), goals = new Set();
   const boxes = []; let player = null;
   const hq = (hollows||[]).slice();
+  const rq = (recursives||[]).slice();
   for(let y=0;y<h;y++){
     if(rows[y].length!==w) throw new Error('ragged map row '+y);
     for(let x=0;x<w;x++){
@@ -108,12 +123,19 @@ function parseSpace(rows, hollows){
       if(c==='#'){ walls.add(k); continue; }
       if(c==='*') goals.add(k);
       else if(c==='P'){ if(player) throw new Error('two players'); player={x,y}; }
-      else if(c==='B') boxes.push({x,y,hollow:null});
+      else if(c==='B') boxes.push({x,y,hollow:null,recursive:null});
       else if(c==='H'){
         const hd = hq.shift();
         if(!hd) throw new Error('H at '+k+' has no hollow def');
-        boxes.push({x,y,hollow:hd});
+        boxes.push({x,y,hollow:hd,recursive:null});
       }
+      else if(c==='R'){
+        const rd = rq.shift();
+        if(!rd) throw new Error('R at '+k+' has no recursive def');
+        boxes.push({x,y,hollow:null,recursive:rd});
+      }
+      else if(c==='&'){ goals.add(k); boxes.push({x,y,hollow:null,recursive:null}); }
+      else if(c==='+'){ goals.add(k); if(player) throw new Error('two players'); player={x,y}; }
       else if(c!=='.' && c!==' ') throw new Error('bad tile '+c+' at '+k);
     }
   }
@@ -139,10 +161,11 @@ function findGaps(sp){
 }
 
 // Load a level def into static structures + initial state.
-// Level def: {name, map:[...], boxes:[...] (solid, rarely needed), hollows:[{door,map,hollows,boxes}]}
+// Level def: {name, map:[...], hollows:[{door,map,hollows,recursives,boxes}],
+//             recursives:[{door}], boxes:[...] (extra solid boxes at root)}
 function loadLevel(def){
-  const spaces={}; const boxes={};
-  let sidc=0, bidc=0;
+  const spaces={}; const boxes={}; const recBoxes={};
+  let sidc=0, bidc=0, ridc=0;
   function buildSpace(parsed, parent){
     const sid='s'+(sidc++);
     const gaps = parent ? findGaps(parsed) : [];
@@ -152,11 +175,17 @@ function loadLevel(def){
     spaces[sid]=sp;
     const boxIds=[];
     for(const b of parsed.boxes){
+      if(b.recursive){
+        const rid='r'+(ridc++);
+        const o=DOOR_OUT[b.recursive.door||'S'];
+        // immovable architecture: not part of state.pos, visible at every depth
+        recBoxes[rid]={id:rid,spaceId:sid,x:b.x,y:b.y,outward:{ox:o[0],oy:o[1]}};
+        continue;
+      }
       const bid='b'+(bidc++);
       if(b.hollow){
         const o=DOOR_OUT[b.hollow.door||'S'];
-        const innerParsed=parseSpace(b.hollow.map, b.hollow.hollows);
-        // inner solid boxes from def
+        const innerParsed=parseSpace(b.hollow.map, b.hollow.hollows, b.hollow.recursives);
         const innerRes=buildSpace(innerParsed,{boxId:bid,spaceId:sid});
         const innerSid=innerRes.sid;
         for(const e of innerRes.boxIds) boxIds.push(e);
@@ -173,215 +202,219 @@ function loadLevel(def){
     }
     return {sid,boxIds,player:parsed.player};
   }
-  const rootParsed=parseSpace(def.map, def.hollows);
+  const rootParsed=parseSpace(def.map, def.hollows, def.recursives);
   // root-level extra solid boxes
-  for(const b of (def.boxes||[])) rootParsed.boxes.push({x:b.x,y:b.y,hollow:null});
+  for(const b of (def.boxes||[])) rootParsed.boxes.push({x:b.x,y:b.y,hollow:null,recursive:null});
   const {sid,boxIds,player}=buildSpace(rootParsed,null);
   if(!player) throw new Error('level has no player start');
-  const state={player:{s:sid,x:player.x,y:player.y},pos:{}};
-  for(const {bid,def:b,space} of boxIds) state.pos[bid]={s:space,x:b.x,y:b.y};
-  return {name:def.name,spaces,boxes,initial:state,rootSid:sid};
+  const state={player:{s:sid,x:player.x,y:player.y,d:0},pos:{}};
+  for(const {bid,def:b,space} of boxIds) state.pos[bid]={s:space,x:b.x,y:b.y,d:0};
+  return {name:def.name,spaces,boxes,recursiveBoxes:recBoxes,initial:state,rootSid:sid};
 }
 
-function boxAt(st, sid, x, y){
+// Entity at (sid,x,y) at depth d: normal box (depth-tagged) or recursive box (every depth).
+function entityAt(level, st, sid, x, y, d){
   for(const bid in st.pos){
     const p=st.pos[bid];
-    if(p.s===sid && p.x===x && p.y===y) return bid;
+    if(p.s===sid&&p.d===d&&p.x===x&&p.y===y) return {kind:'box',id:bid};
+  }
+  for(const rid in level.recursiveBoxes){
+    const R=level.recursiveBoxes[rid];
+    if(R.spaceId===sid&&R.x===x&&R.y===y) return {kind:'rec',id:rid};
   }
   return null;
 }
 function inBounds(S,x,y){ return x>=0&&y>=0&&x<S.w&&y<S.h; }
-function cellFreeForBox(level,st,sid,x,y){
+function cellFreeForBox(level,st,sid,x,y,d){
   const S=level.spaces[sid];
-  return inBounds(S,x,y)&&!S.walls.has(key(x,y))&&!boxAt(st,sid,x,y);
+  return inBounds(S,x,y)&&!S.walls.has(key(x,y))&&!entityAt(level,st,sid,x,y,d);
 }
-// BFS nearest free floor cell (no box, not the door gap) from (x,y) in space sid.
-function nearestFree(level,st,sid,x,y){
+// BFS nearest free cell (no entity, not the door gap) from (x,y) in space sid at depth d.
+function nearestFree(level,st,sid,x,y,d){
   const S=level.spaces[sid];
   const seen=new Set([key(x,y)]); const q=[{x,y}];
   while(q.length){
     const c=q.shift();
     const isGap=S.gap&&c.x===S.gap.x&&c.y===S.gap.y;
-    if(!isGap&&inBounds(S,c.x,c.y)&&!S.walls.has(key(c.x,c.y))&&!boxAt(st,sid,c.x,c.y)) return c;
-    for(const d of [[0,1],[0,-1],[1,0],[-1,0]]){
-      const nx=c.x+d[0],ny=c.y+d[1],k=key(nx,ny);
+    if(!isGap&&inBounds(S,c.x,c.y)&&!S.walls.has(key(c.x,c.y))&&!entityAt(level,st,sid,c.x,c.y,d)) return c;
+    for(const dd of [[0,1],[0,-1],[1,0],[-1,0]]){
+      const nx=c.x+dd[0],ny=c.y+dd[1],k=key(nx,ny);
       if(!seen.has(k)){seen.add(k);q.push({x:nx,y:ny});}
     }
   }
   return null;
 }
+// Landing cell for descend/ascend through recursive box R: prefer the neighbor on
+// the given side (ox,oy), fall back to BFS nearest free.
+function placeNear(level,st,sid,R,d,ox,oy){
+  const S=level.spaces[sid];
+  const px=R.x+ox, py=R.y+oy;
+  if(inBounds(S,px,py)&&!S.walls.has(key(px,py))&&!entityAt(level,st,sid,px,py,d)) return {x:px,y:py};
+  return nearestFree(level,st,sid,R.x,R.y,d);
+}
 
 function cloneState(st){
   const pos={};
-  for(const bid in st.pos) pos[bid]={s:st.pos[bid].s,x:st.pos[bid].x,y:st.pos[bid].y};
-  return {player:{s:st.player.s,x:st.player.x,y:st.player.y},pos};
+  for(const bid in st.pos){const p=st.pos[bid];pos[bid]={s:p.s,x:p.x,y:p.y,d:p.d};}
+  const pl=st.player;
+  return {player:{s:pl.s,x:pl.x,y:pl.y,d:pl.d},pos};
 }
 function stateKey(st){
-  const parts=[st.player.s+':'+st.player.x+','+st.player.y];
+  const pl=st.player;
+  const parts=[pl.s+':'+pl.d+':'+pl.x+','+pl.y];
   const bids=Object.keys(st.pos).sort();
-  for(const b of bids){const p=st.pos[b];parts.push(b+'='+p.s+':'+p.x+','+p.y);}
+  for(const b of bids){const p=st.pos[b];parts.push(b+'='+p.s+':'+p.d+':'+p.x+','+p.y);}
   return parts.join('|');
 }
 
-// Exit entity (player if bid null, else box bid) from inner space S outward.
+// Exit entity (player if bid null, else box bid) from inner space S outward. Depth preserved.
 function doExit(level,st,S,bid){
   const parent=S.parent; if(!parent) return false;
   const O=level.spaces[parent.spaceId];
   const pp=st.pos[parent.boxId];
+  const d=bid?st.pos[bid].d:st.player.d;
   const lx=pp.x+S.gap.ox, ly=pp.y+S.gap.oy;
-  if(!cellFreeForBox(level,st,O.id,lx,ly)) return false;
+  if(!cellFreeForBox(level,st,O.id,lx,ly,d)) return false;
   if(bid){
     const old=st.pos[bid];
-    st.pos[bid]={s:O.id,x:lx,y:ly};
-    st.player={s:old.s,x:old.x,y:old.y};
+    st.pos[bid]={s:O.id,x:lx,y:ly,d:old.d};
+    st.player={s:old.s,x:old.x,y:old.y,d:old.d};
   }else{
-    st.player={s:O.id,x:lx,y:ly};
+    st.player={s:O.id,x:lx,y:ly,d:st.player.d};
   }
   return true;
 }
 
 // The single move function. Mutates st. Returns true if the move happened.
-function move(level, st, dx, dy){
+// maxDepth caps recursion depth (solver passes a finite cap; game uses Infinity).
+function move(level, st, dx, dy, maxDepth){
+  maxDepth=(maxDepth===undefined)?Infinity:maxDepth;
   const S=level.spaces[st.player.s];
+  const d=st.player.d;
   const nx=st.player.x+dx, ny=st.player.y+dy;
   if(!inBounds(S,nx,ny)||S.walls.has(key(nx,ny))) return false;
   const isGap=S.gap&&nx===S.gap.x&&ny===S.gap.y;
-  const b=boxAt(st,S.id,nx,ny);
-  if(b){
-    const B=level.boxes[b];
+  const e=entityAt(level,st,S.id,nx,ny,d);
+  if(e){
+    if(e.kind==='rec'){
+      const R=level.recursiveBoxes[e.id];
+      if(dx===-R.outward.ox&&dy===-R.outward.oy){
+        // through the gold door: descend
+        if(d+1>maxDepth) return false;
+        const cell=placeNear(level,st,S.id,R,d+1,R.outward.ox,R.outward.oy);
+        if(!cell) return false;
+        st.player={s:S.id,x:cell.x,y:cell.y,d:d+1};
+        return true;
+      }
+      if(dx===R.outward.ox&&dy===R.outward.oy){
+        // bump the back of the box: ascend
+        if(d===0) return false;
+        const cell=placeNear(level,st,S.id,R,d-1,-R.outward.ox,-R.outward.oy);
+        if(!cell) return false;
+        st.player={s:S.id,x:cell.x,y:cell.y,d:d-1};
+        return true;
+      }
+      return false; // solid from the sides
+    }
+    const B=level.boxes[e.id];
     // enter hollow box through its door?
     if(B.hollow&&dx===-B.outward.ox&&dy===-B.outward.oy){
       const I=level.spaces[B.innerSpace];
-      const cell=nearestFree(level,st,I.id,I.gap.ix,I.gap.iy);
+      const cell=nearestFree(level,st,I.id,I.gap.ix,I.gap.iy,d);
       if(!cell) return false;
-      st.player={s:I.id,x:cell.x,y:cell.y};
+      st.player={s:I.id,x:cell.x,y:cell.y,d:d};
       return true;
     }
-    return pushBox(level,st,b,dx,dy);
+    return pushBox(level,st,e.id,dx,dy,maxDepth);
   }
   if(isGap) return doExit(level,st,S,null);
   st.player.x=nx; st.player.y=ny;
   return true;
 }
 
-function pushBox(level, st, bid, dx, dy){
+function pushBox(level, st, bid, dx, dy, maxDepth){
+  maxDepth=(maxDepth===undefined)?Infinity:maxDepth;
   const B=level.boxes[bid];
   const bp=st.pos[bid];
+  const d=bp.d;
   const S=level.spaces[bp.s];
   const nx=bp.x+dx, ny=bp.y+dy;
   if(!inBounds(S,nx,ny)||S.walls.has(key(nx,ny))) return false;
   const isGap=S.gap&&nx===S.gap.x&&ny===S.gap.y;
-  const ob=boxAt(st,S.id,nx,ny);
-  if(ob){
-    const OB=level.boxes[ob];
+  const e=entityAt(level,st,S.id,nx,ny,d);
+  if(e){
+    if(e.kind==='rec'){
+      const R=level.recursiveBoxes[e.id];
+      if(dx===-R.outward.ox&&dy===-R.outward.oy){
+        // push through the gold door: box descends
+        if(d+1>maxDepth) return false;
+        const cell=placeNear(level,st,S.id,R,d+1,R.outward.ox,R.outward.oy);
+        if(!cell) return false;
+        st.pos[bid]={s:S.id,x:cell.x,y:cell.y,d:d+1};
+        st.player={s:bp.s,x:bp.x,y:bp.y,d:d};
+        return true;
+      }
+      if(dx===R.outward.ox&&dy===R.outward.oy){
+        // push into the back of the box: box ascends
+        if(d===0) return false;
+        const cell=placeNear(level,st,S.id,R,d-1,-R.outward.ox,-R.outward.oy);
+        if(!cell) return false;
+        st.pos[bid]={s:S.id,x:cell.x,y:cell.y,d:d-1};
+        st.player={s:bp.s,x:bp.x,y:bp.y,d:d};
+        return true;
+      }
+      return false;
+    }
+    const OB=level.boxes[e.id];
     // push into a hollow box through its door?
     if(OB.hollow&&dx===-OB.outward.ox&&dy===-OB.outward.oy){
       const I=level.spaces[OB.innerSpace];
-      const cell=nearestFree(level,st,I.id,I.gap.ix,I.gap.iy);
+      const cell=nearestFree(level,st,I.id,I.gap.ix,I.gap.iy,d);
       if(!cell) return false;
-      st.pos[bid]={s:I.id,x:cell.x,y:cell.y};
-      st.player={s:bp.s,x:bp.x,y:bp.y};
+      st.pos[bid]={s:I.id,x:cell.x,y:cell.y,d:d};
+      st.player={s:bp.s,x:bp.x,y:bp.y,d:d};
       return true;
     }
     return false;
   }
   if(isGap) return doExit(level,st,S,bid);
-  st.pos[bid]={s:bp.s,x:nx,y:ny};
-  st.player={s:bp.s,x:bp.x,y:bp.y};
+  st.pos[bid]={s:bp.s,x:nx,y:ny,d:d};
+  st.player={s:bp.s,x:bp.x,y:bp.y,d:d};
   return true;
 }
 
+// Win: every goal (in every space) covered by a box at depth 0.
+// Boxes nested inside recursion do NOT count.
 function isWin(level,st){
   for(const sid in level.spaces){
     const S=level.spaces[sid];
     for(const g of S.goals){
       const [gx,gy]=g.split(',').map(Number);
-      if(!boxAt(st,sid,gx,gy)) return false;
+      let ok=false;
+      for(const bid in st.pos){
+        const p=st.pos[bid];
+        if(p.s===sid&&p.d===0&&p.x===gx&&p.y===gy){ok=true;break;}
+      }
+      if(!ok) return false;
     }
   }
   return true;
 }
 
-// BFS solver. Returns array of [dx,dy] or null if unsolvable within cap.
-function solve(level, cap){
-  cap=cap||200000;
-  const start=cloneState(level.initial);
-  const sk=stateKey(start);
-  const prev=new Map(); prev.set(sk,null);
-  const q=[start]; let qi=0;
-  const dirs=[[0,1],[0,-1],[1,0],[-1,0]];
-  while(qi<q.length){
-    if(qi>=cap) return null;
-    const cur=q[qi++];
-    if(isWin(level,cur)){
-      const path=[]; let k=stateKey(cur);
-      while(prev.get(k)){const [pk,d]=prev.get(k);path.unshift(d);k=pk;}
-      return path;
-    }
-    for(const d of dirs){
-      const ns=cloneState(cur);
-      if(move(level,ns,d[0],d[1])){
-        const k=stateKey(ns);
-        if(!prev.has(k)){prev.set(k,[stateKey(cur),d]);q.push(ns);}
-      }
-    }
-  }
-  return null;
-}
+if(typeof module!=='undefined'){module.exports={loadLevel,move,pushBox,isWin,cloneState,stateKey,entityAt,DIRS,DOOR_OUT};}
 
-if(typeof module!=='undefined'){module.exports={loadLevel,move,pushBox,isWin,solve,cloneState,stateKey,DIRS};}
 /* ===== levels.js ===== */
 'use strict';
 /* Recurse — level definitions. Legend: # wall, . floor, * goal, P player,
-   B solid box, H hollow box (hollows[] consumed in row-major H order).
-   All hollow doors face South in this set; inner maps have one south gap. */
+   B solid box, H hollow box (hollows[] consumed in row-major H order),
+   R recursive box (recursives[] consumed in row-major R order; {door}),
+   & box on goal, + player on goal.
+   Recursive boxes are immovable: walk/push through the gold door to descend one
+   level, bump the back of the box to ascend. Only depth-0 boxes count for goals.
+   Levels ordered by measured difficulty (BFS solution length). */
 
 const LEVELS=[
-{
-name:'First Push',
-hint:'Push the box onto the glowing goal. Swipe or use arrow keys.',
-map:[
-'#####',
-'#P.B*',
-'#####',
-],
-},
-{
-name:'Open the Box',
-hint:'Some boxes are hollow. Walk into this one from below.',
-map:[
-'#######',
-'#.....#',
-'#.P.H.#',
-'#.....#',
-'#######',
-],
-hollows:[{door:'S',map:[
-'#####',
-'#.*.#',
-'#.B.#',
-'#...#',
-'##.##',
-]}],
-},
-{
-name:'Take It Out',
-hint:'The box you need is inside. Push it out through the door.',
-map:[
-'#######',
-'#.....#',
-'#.P.H.#',
-'#...*.#',
-'#######',
-],
-hollows:[{door:'S',map:[
-'#####',
-'#...#',
-'#.B.#',
-'#...#',
-'##.##',
-]}],
-},
+// ---- existing 8, ordered by solution length ----
 {
 name:'Put It In',
 hint:'Push the box north, straight into the hollow box.',
@@ -402,22 +435,48 @@ hollows:[{door:'S',map:[
 ]}],
 },
 {
-name:'Inside Job',
-hint:'Send the box in, then follow it and finish the job inside.',
+name:'First Push',
+hint:'Push the box onto the glowing goal. Swipe or use arrow keys.',
 map:[
 '#####',
-'#...#',
-'#.H.#',
-'#.B.#',
-'#.P.#',
+'#P.B*',
 '#####',
 ],
-hollows:[{door:'S',map:[
+},
+{
+name:'Take It Out',
+hint:'The box you need is inside. Push it out through the door.',
+map:[
 '#######',
 '#.....#',
-'#.B.*.#',
+'#.P.H.#',
+'#...*.#',
+'#######',
+],
+hollows:[{door:'S',map:[
+'#####',
+'#...#',
+'#.B.#',
+'#...#',
+'##.##',
+]}],
+},
+{
+name:'Open the Box',
+hint:'Some boxes are hollow. Walk into this one from below.',
+map:[
+'#######',
 '#.....#',
-'###.###',
+'#.P.H.#',
+'#.....#',
+'#######',
+],
+hollows:[{door:'S',map:[
+'#####',
+'#.*.#',
+'#.B.#',
+'#...#',
+'##.##',
 ]}],
 },
 {
@@ -446,6 +505,43 @@ hollows:[{door:'S',map:[
 ]}]}],
 },
 {
+name:'Heavy Lifting',
+hint:'Hollow boxes can be pushed too. Get this one onto the goal.',
+map:[
+'#######',
+'#.....#',
+'#.P.H.#',
+'#..*..#',
+'#######',
+],
+hollows:[{door:'S',map:[
+'#####',
+'#...#',
+'#...#',
+'#...#',
+'##.##',
+]}],
+},
+{
+name:'Inside Job',
+hint:'Send the box in, then follow it and finish the job inside.',
+map:[
+'#####',
+'#...#',
+'#.H.#',
+'#.B.#',
+'#.P.#',
+'#####',
+],
+hollows:[{door:'S',map:[
+'#######',
+'#.....#',
+'#.B.*.#',
+'#.....#',
+'###.###',
+]}],
+},
+{
 name:'Trade Up',
 hint:'Push the box in from outside, then go in after it.',
 map:[
@@ -466,30 +562,179 @@ hollows:[{door:'S',map:[
 '##.##',
 ]}],
 },
+// ---- recursion arc (forced via trapped blockers) ----
 {
-name:'Heavy Lifting',
-hint:'Hollow boxes can be pushed too. Get this one onto the goal.',
+name:'Down the Rabbit Hole',
+hint:'The ∞ box holds the same room, one level deeper. Push the box in through the gold door, follow it down, walk it around, and bring it back out the back.',
+map:[
+'#######',
+'#P....#',
+'#..B..#',
+'##.RB##',
+'#..*..#',
+'#.....#',
+'#######',
+],
+recursives:[{door:'N'}],
+},
+{
+name:'Mirror',
+hint:'Same trick, new angle. The ∞ box works from any side.',
 map:[
 '#######',
 '#.....#',
-'#.P.H.#',
+'#..*..#',
+'##.RB##',
+'#..B..#',
+'#....P#',
+'#######',
+],
+recursives:[{door:'S'}],
+},
+{
+name:'Double Down',
+hint:'Two boxes need the loop. One at a time — they can share the ride down.',
+map:[
+'#######',
+'#P....#',
+'#..B..#',
+'##.RB##',
+'#..*..#',
+'#..B..#',
 '#..*..#',
 '#######',
 ],
-hollows:[{door:'S',map:[
+recursives:[{door:'N'}],
+},
+// ---- hard sokoban ----
+{
+name:'Offset',
+hint:'The goals are off-center. Plan the pushes.',
+map:[
+'########',
+'#P.....#',
+'#.BBB..#',
+'#......#',
+'#*.*.*.#',
+'########',
+],
+},
+{
+name:'Alignment',
+hint:'Three boxes, three goals. Get them lined up.',
+map:[
+'########',
+'#P.....#',
+'#.BBB..#',
+'#......#',
+'#***...#',
+'########',
+],
+},
+{
+name:'Shifted',
+hint:'Everything is one step over. Mind the order.',
+map:[
+'########',
+'#P.....#',
+'#.BBB..#',
+'#......#',
+'#..***.#',
+'########',
+],
+},
+{
+name:'Crossroads',
+hint:'Four boxes, tight halls. Do not get stuck.',
+map:[
+'########',
+'#P..#..#',
+'#.B.#B.#',
+'#......#',
+'#.B....#',
+'#.*#*.*#',
+'########',
+],
+},
+{
+name:'Pillar',
+hint:'The pillar splits the room. Work around it.',
+map:[
+'########',
+'#P.....#',
+'#.BBB..#',
+'#..#...#',
+'#......#',
+'#***...#',
+'########',
+],
+},
+{
+name:'Tower',
+hint:'A tall climb. Bring every box to the top... er, bottom.',
+map:[
 '#####',
+'#P..#',
+'#.B.#',
 '#...#',
+'#.B.#',
 '#...#',
+'#.B.#',
 '#...#',
-'##.##',
-]}],
+'#***#',
+'#####',
+],
+},
+{
+name:'Zigzag',
+hint:'Twist through the halls.',
+map:[
+'#########',
+'#P......#',
+'#.B.....#',
+'#.#####.#',
+'#.....#.#',
+'#.B.#.#.#',
+'#...#...#',
+'#.B...*.#',
+'#.....#*#',
+'#########',
+],
+},
+{
+name:'Side Step',
+hint:'One step sideways changes everything.',
+map:[
+'#########',
+'#P......#',
+'#..BBB..#',
+'#...#...#',
+'#.......#',
+'#...***.#',
+'#########',
+],
+},
+{
+name:'Detour',
+hint:'The long way is the only way. The finale — good luck.',
+map:[
+'########',
+'#P.....#',
+'#.BBB..#',
+'#..#...#',
+'#..#...#',
+'#......#',
+'#***...#',
+'########',
+],
 },
 ];
 
 if(typeof module!=='undefined'){module.exports={LEVELS};}
+
 /* ===== ui.js ===== */
 'use strict';
-/* Recurse — UI layer (DOM + canvas). game.js and levels.js are inlined above. */
+/* Recurse — UI layer (DOM + canvas). engine.js and levels.js are inlined above. */
 
 const canvas=document.getElementById('game');
 const ctx=canvas.getContext('2d');
@@ -507,7 +752,8 @@ window.addEventListener('resize',resize); resize();
 // ---------- state ----------
 let levelIdx=0, level=null, state=null, undoStack=[];
 let viewSpace=null;                 // space id currently viewed
-let viewAnim=null;                  // {oldS,newS,t0,dur,dir}
+let viewDepth=0;                    // recursion depth currently viewed
+let viewAnim=null;                  // {oldS,newS,oldD,newD,t0,dur,dir}
 let renderPos={};                   // bid -> {x,y} lerped (view space only)
 let playerRender={x:0,y:0};
 let progress={unlocked:0,done:{}};
@@ -518,7 +764,8 @@ const COLORS={
   bg:'#0e0f14', floor:'#171a21', wall:'#2b303c', wallTop:'#3a4152',
   goal:'#f5b942', goalGlow:'rgba(245,185,66,.35)',
   solid:'#e2603f', hollow:'#39c6d6', hollowDim:'rgba(57,198,214,.16)',
-  door:'#ffe66d', player:'#f4f1ea', text:'#e8e6df', dim:'#8a8fa0'
+  door:'#ffe66d', player:'#f4f1ea', text:'#e8e6df', dim:'#8a8fa0',
+  recGlow:'rgba(177,156,255,.55)'
 };
 
 function loadLevelIdx(i){
@@ -527,6 +774,7 @@ function loadLevelIdx(i){
   state=cloneState(level.initial);
   undoStack=[];
   viewSpace=state.player.s;
+  viewDepth=state.player.d;
   viewAnim=null;
   renderPos={};
   for(const bid in state.pos){const p=state.pos[bid];renderPos[bid]={x:p.x,y:p.y};}
@@ -542,15 +790,16 @@ function updateMoves(){
 }
 
 function doMove(dx,dy){
-  const before=viewSpace;
+  const beforeS=viewSpace, beforeD=viewDepth;
   undoStack.push(cloneState(state));
   if(undoStack.length>1000)undoStack.shift();
   if(!move(level,state,dx,dy)){undoStack.pop();return;}
   updateMoves();
-  if(state.player.s!==before){
-    viewAnim={oldS:before,newS:state.player.s,t0:performance.now(),dur:320,
-              dir:depthOf(state.player.s)>depthOf(before)?'in':'out'};
-    viewSpace=state.player.s;
+  viewSpace=state.player.s; viewDepth=state.player.d;
+  if(viewSpace!==beforeS||viewDepth!==beforeD){
+    const dOld=depthOf(beforeS)+beforeD, dNew=depthOf(viewSpace)+viewDepth;
+    viewAnim={oldS:beforeS,newS:viewSpace,oldD:beforeD,newD:viewDepth,
+              t0:performance.now(),dur:320,dir:dNew>=dOld?'in':'out'};
   }
   if(isWin(level,state)){
     const moves=undoStack.length;
@@ -565,9 +814,11 @@ function depthOf(sid){let d=0,s=level.spaces[sid];while(s&&s.parent){d++;s=level
 function undo(){
   if(!undoStack.length)return;
   state=undoStack.pop();
-  const before=viewSpace;
-  viewSpace=state.player.s;
-  if(viewSpace!==before)viewAnim={oldS:before,newS:viewSpace,t0:performance.now(),dur:320,dir:'out'};
+  const beforeS=viewSpace, beforeD=viewDepth;
+  viewSpace=state.player.s; viewDepth=state.player.d;
+  if(viewSpace!==beforeS||viewDepth!==beforeD)
+    viewAnim={oldS:beforeS,newS:viewSpace,oldD:beforeD,newD:viewDepth,
+              t0:performance.now(),dur:320,dir:'out'};
   updateMoves();
 }
 function reset(){loadLevelIdx(levelIdx);}
@@ -614,11 +865,9 @@ function layout(sid){
   const ox=(W-cell*S.w)/2, oy=(H-hudH-cell*S.h)/2+8;
   return {S,cell,ox,oy};
 }
-function boxAtRender(sid,x,y){
-  for(const bid in state.pos){const p=state.pos[bid];if(p.s===sid&&p.x===x&&p.y===y)return bid;}
-  return null;
-}
-function drawSpace(sid,ox,oy,cell,depth){
+// Draw space sid as seen at recursion depth wd. Normal boxes/player are
+// depth-filtered; recursive boxes exist at every depth.
+function drawSpace(sid,wd,ox,oy,cell,depth){
   const S=level.spaces[sid];
   for(let y=0;y<S.h;y++)for(let x=0;x<S.w;x++){
     const px=ox+x*cell,py=oy+y*cell,k=x+','+y;
@@ -643,14 +892,20 @@ function drawSpace(sid,ox,oy,cell,depth){
   for(let x=0;x<=S.w;x++){ctx.moveTo(ox+x*cell,oy);ctx.lineTo(ox+x*cell,oy+S.h*cell);}
   for(let y=0;y<=S.h;y++){ctx.moveTo(ox,oy+y*cell);ctx.lineTo(ox+S.w*cell,oy+y*cell);}
   ctx.stroke();
-  // boxes
+  // recursive boxes (architecture — drawn at every depth)
+  for(const rid in level.recursiveBoxes){
+    const R=level.recursiveBoxes[rid];
+    if(R.spaceId!==sid)continue;
+    drawRec(R,ox+R.x*cell,oy+R.y*cell,cell,depth,wd);
+  }
+  // normal boxes (depth-filtered)
   for(const bid in state.pos){
-    const p=state.pos[bid];if(p.s!==sid)continue;
+    const p=state.pos[bid];if(p.s!==sid||p.d!==wd)continue;
     const B=level.boxes[bid];
     const px=ox+p.x*cell,py=oy+p.y*cell;
     let rx=px,ry=py;
     if(depth===0&&renderPos[bid]){rx=ox+renderPos[bid].x*cell;ry=oy+renderPos[bid].y*cell;}
-    if(B.hollow)drawHollow(B,bid,rx,ry,cell,depth);
+    if(B.hollow)drawHollow(B,bid,rx,ry,cell,depth,wd);
     else{
       const m=cell*0.12;
       ctx.fillStyle=COLORS.solid;
@@ -659,8 +914,8 @@ function drawSpace(sid,ox,oy,cell,depth){
       roundRect(rx+m*1.6,ry+m*1.6,cell-3.2*m,(cell-3.2*m)*0.32,cell*0.1);ctx.fill();
     }
   }
-  // player
-  if(state.player.s===sid){
+  // player (depth-filtered)
+  if(state.player.s===sid&&state.player.d===wd){
     let px=state.player.x,py=state.player.y;
     if(depth===0){px=playerRender.x;py=playerRender.y;}
     const cx=ox+(px+0.5)*cell,cy=oy+(py+0.5)*cell,r=cell*0.32;
@@ -673,7 +928,7 @@ function drawSpace(sid,ox,oy,cell,depth){
     ctx.beginPath();ctx.arc(cx-r*0.32,cy-r*0.1,r*0.16,0,7);ctx.arc(cx+r*0.32,cy-r*0.1,r*0.16,0,7);ctx.fill();
   }
 }
-function drawHollow(B,bid,px,py,cell,depth){
+function drawHollow(B,bid,px,py,cell,depth,wd){
   const m=cell*0.1;
   // shell
   ctx.strokeStyle=COLORS.hollow;ctx.lineWidth=Math.max(2,cell*0.07);
@@ -715,22 +970,81 @@ function drawHollow(B,bid,px,py,cell,depth){
   ctx.save();
   ctx.beginPath();ctx.rect(x0,y0,iw,ih);ctx.clip();
   ctx.fillStyle='rgba(0,0,0,.25)';ctx.fillRect(x0,y0,iw,ih);
-  drawSpace(I.id,iox,ioy,ic,depth+1);
+  drawSpace(I.id,wd,iox,ioy,ic,depth+1);
+  ctx.restore();
+}
+// Recursive box: teal shell like a hollow box, but with an ∞ motif, a violet
+// glow, and a chevron on the back edge (bump it to ascend). Its inner view is
+// the same space one level deeper.
+function drawRec(R,px,py,cell,depth,wd){
+  const m=cell*0.1;
+  const x0=px+m,y0=py+m,x1=px+cell-m,y1=py+cell-m;
+  const o=R.outward,g=cell*0.22;
+  ctx.save();
+  ctx.shadowColor=COLORS.recGlow;ctx.shadowBlur=cell*0.4;
+  ctx.strokeStyle=COLORS.hollow;ctx.lineWidth=Math.max(2,cell*0.07);
+  ctx.beginPath();
+  const seg=(ax,ay,bx,by)=>{ctx.moveTo(ax,ay);ctx.lineTo(bx,by);};
+  const cx=(x0+x1)/2, cy=(y0+y1)/2;
+  if(o.oy===1){ // door south, back north
+    seg(x0,y0,x1,y0);seg(x1,y0,x1,y1);seg(x0,y0,x0,y1);
+    seg(x0,y1,cx-g/2,y1);seg(cx+g/2,y1,x1,y1);
+    ctx.fillStyle=COLORS.door;ctx.fillRect(cx-g/2,y1-cell*0.05,g,cell*0.1);
+    // ascend chevron on back (north) edge
+    ctx.strokeStyle=COLORS.door;ctx.lineWidth=Math.max(1.5,cell*0.05);
+    ctx.beginPath();ctx.moveTo(cx-g*0.35,y0+cell*0.16);ctx.lineTo(cx,y0+cell*0.07);ctx.lineTo(cx+g*0.35,y0+cell*0.16);ctx.stroke();
+  }else if(o.oy===-1){ // door north, back south
+    seg(x0,y1,x1,y1);seg(x1,y0,x1,y1);seg(x0,y0,x0,y1);
+    seg(x0,y0,cx-g/2,y0);seg(cx+g/2,y0,x1,y0);
+    ctx.fillStyle=COLORS.door;ctx.fillRect(cx-g/2,y0-cell*0.05,g,cell*0.1);
+    ctx.strokeStyle=COLORS.door;ctx.lineWidth=Math.max(1.5,cell*0.05);
+    ctx.beginPath();ctx.moveTo(cx-g*0.35,y1-cell*0.16);ctx.lineTo(cx,y1-cell*0.07);ctx.lineTo(cx+g*0.35,y1-cell*0.16);ctx.stroke();
+  }else if(o.ox===1){ // door east, back west
+    seg(x0,y0,x0,y1);seg(x0,y0,x1,y0);seg(x0,y1,x1,y1);
+    seg(x1,y0,x1,cy-g/2);seg(x1,cy+g/2,x1,y1);
+    ctx.fillStyle=COLORS.door;ctx.fillRect(x1-cell*0.05,cy-g/2,cell*0.1,g);
+    ctx.strokeStyle=COLORS.door;ctx.lineWidth=Math.max(1.5,cell*0.05);
+    ctx.beginPath();ctx.moveTo(x0+cell*0.16,cy-g*0.35);ctx.lineTo(x0+cell*0.07,cy);ctx.lineTo(x0+cell*0.16,cy+g*0.35);ctx.stroke();
+  }else{ // door west, back east
+    seg(x1,y0,x1,y1);seg(x0,y0,x1,y0);seg(x0,y1,x1,y1);
+    seg(x0,y0,x0,cy-g/2);seg(x0,cy+g/2,x0,y1);
+    ctx.fillStyle=COLORS.door;ctx.fillRect(x0-cell*0.05,cy-g/2,cell*0.1,g);
+    ctx.strokeStyle=COLORS.door;ctx.lineWidth=Math.max(1.5,cell*0.05);
+    ctx.beginPath();ctx.moveTo(x1-cell*0.16,cy-g*0.35);ctx.lineTo(x1-cell*0.07,cy);ctx.lineTo(x1-cell*0.16,cy+g*0.35);ctx.stroke();
+  }
+  ctx.stroke();
+  // ∞ motif in the center
+  ctx.shadowBlur=0;
+  ctx.fillStyle=COLORS.door;
+  ctx.font='700 '+Math.round(cell*0.52)+'px system-ui';
+  ctx.textAlign='center';ctx.textBaseline='middle';
+  ctx.fillText('∞',cx,cy+cell*0.02);
+  ctx.restore();
+  // nested view: same space, one level deeper
+  if(depth>=4)return;
+  const S=level.spaces[R.spaceId];
+  const iw=x1-x0, ih=y1-y0;
+  const ic=Math.min(iw/S.w,ih/S.h)*0.92;
+  const iox=x0+(iw-ic*S.w)/2, ioy=y0+(ih-ic*S.h)/2;
+  ctx.save();
+  ctx.beginPath();ctx.rect(x0,y0,iw,ih);ctx.clip();
+  ctx.fillStyle='rgba(0,0,0,.25)';ctx.fillRect(x0,y0,iw,ih);
+  drawSpace(S.id,wd+1,iox,ioy,ic,depth+1);
   ctx.restore();
 }
 
 function render(now){
   ctx.fillStyle=COLORS.bg;ctx.fillRect(0,0,W,H);
-  // lerp render positions toward logic (view space only)
+  // lerp render positions toward logic (view space+depth only)
   const k=0.28;
   for(const bid in state.pos){
     const p=state.pos[bid];
-    if(!renderPos[bid]||p.s!==viewSpace){renderPos[bid]={x:p.x,y:p.y};continue;}
+    if(!renderPos[bid]||p.s!==viewSpace||p.d!==viewDepth){renderPos[bid]={x:p.x,y:p.y};continue;}
     const r=renderPos[bid];
     r.x+=(p.x-r.x)*k; r.y+=(p.y-r.y)*k;
     if(Math.abs(r.x-p.x)<0.01)r.x=p.x; if(Math.abs(r.y-p.y)<0.01)r.y=p.y;
   }
-  if(state.player.s===viewSpace){
+  if(state.player.s===viewSpace&&state.player.d===viewDepth){
     playerRender.x+=(state.player.x-playerRender.x)*k;
     playerRender.y+=(state.player.y-playerRender.y)*k;
   }else{playerRender={x:state.player.x,y:state.player.y};}
@@ -738,27 +1052,29 @@ function render(now){
   if(viewAnim){
     const t=Math.min(1,(now-viewAnim.t0)/viewAnim.dur);
     const e=1-Math.pow(1-t,3);
-    drawView(viewAnim.oldS,viewAnim.dir==='in'?1+0.7*e:1-0.45*e,1-e);
-    drawView(viewAnim.newS,viewAnim.dir==='in'?1.7-0.7*e:0.55+0.45*e,e);
+    drawView(viewAnim.oldS,viewAnim.oldD,viewAnim.dir==='in'?1+0.7*e:1-0.45*e,1-e);
+    drawView(viewAnim.newS,viewAnim.newD,viewAnim.dir==='in'?1.7-0.7*e:0.55+0.45*e,e);
     if(t>=1)viewAnim=null;
   }else{
-    drawView(viewSpace,1,1);
+    drawView(viewSpace,viewDepth,1,1);
   }
   // depth breadcrumb
-  const d=depthOf(viewSpace);
+  const d=depthOf(viewSpace)+viewDepth;
   if(d>0){
     ctx.fillStyle=COLORS.dim;ctx.font='13px system-ui';ctx.textAlign='center';
-    ctx.fillText('depth '+d+' · '+(d===1?'inside a box':'inside '.concat(d,' boxes')),W/2,H-58);
+    let label='depth '+d+' · '+(d===1?'inside a box':'inside '+d+' boxes');
+    if(viewDepth>0)label+=' · ∞';
+    ctx.fillText(label,W/2,H-58);
   }
   requestAnimationFrame(render);
 }
-function drawView(sid,scale,alpha){
+function drawView(sid,wd,scale,alpha){
   const {S,cell,ox,oy}=layout(sid);
   ctx.save();
   ctx.globalAlpha=alpha;
   const cx=ox+S.w*cell/2, cy=oy+S.h*cell/2;
   ctx.translate(cx,cy);ctx.scale(scale,scale);ctx.translate(-cx,-cy);
-  drawSpace(sid,ox,oy,cell,0);
+  drawSpace(sid,wd,ox,oy,cell,0);
   ctx.restore();
 }
 
@@ -797,4 +1113,5 @@ let seenHelp=false;
 try{seenHelp=!!localStorage.getItem('recurse-seen-help');}catch(e){}
 if(!seenHelp){showOverlay('helpOverlay');try{localStorage.setItem('recurse-seen-help','1');}catch(e){}}
 requestAnimationFrame(render);
+
 </script></body></html>
